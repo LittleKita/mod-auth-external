@@ -219,6 +219,20 @@ static const command_rec authnz_socket_cmds[] =
     { NULL }
 };
 
+int aprsprintf(apr_socket_t *as, const char *format, ...) {
+    va_list ap;
+    char buffer[1024*10];
+    memset(buffer, 0, sizeof(buffer));
+    va_start(ap, format);
+    int len = vsprintf(buffer, format, ap);
+    apr_size_t sendLen = len;
+
+    if(apr_socket_send(as, buffer, &sendLen) != APR_SUCCESS) {
+        return -1;
+    }
+    return len;
+}
+
 /* Run an socket authentication program using the given port for passing
  * in the data.  The login name is always passed in.   Dataname is "GROUP" or
  * "PASS" and data is the group list or password being checked.  To launch
@@ -237,6 +251,7 @@ static const command_rec authnz_socket_cmds[] =
  */
 static int exec_socket(const char *chost, const char *cport, const request_rec *r, const char *dataname, const char *data)
 {
+    // Socket example see http://dev.ariel-networks.com/apr/apr-tutorial/sample/client-sample.c
     conn_rec *c= r->connection;
 
     /* Set various flags based on the execution port */
@@ -245,78 +260,69 @@ static int exec_socket(const char *chost, const char *cport, const request_rec *
      * just inherit apache's environment variables.
      */
 
-    struct hostent *he = gethostbyname(chost);
-    if(he == NULL) {
-        herror("gethostbyname");
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-	    "could not resolve hostname: %s", chost);
+    apr_pool_t *mp = r->pool;
+    apr_sockaddr_t *sa;
+    apr_socket_t *s;
+    
+    if(apr_sockaddr_info_get(&sa, chost, APR_INET, atoi(cport), 0, mp) != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r, "could not resolve hostname: %s", chost);
+        return -1;
+    }
+
+    if (apr_socket_create(&s, sa->family, SOCK_STREAM, APR_PROTO_TCP, mp) != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r, "could not create socket");
 	    return -1;
     }
 
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if(s < 0) {
-        perror("socket");
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-	    "could not create socket");
-	    return -1;
+    apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
+    apr_socket_timeout_set(s, (APR_USEC_PER_SEC * 10));
+    
+    if (apr_socket_connect(s, sa) != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r, "could connect socket %s:%d", chost, atoi(cport));
+        apr_socket_close(s);
+        return -1;
     }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(struct sockaddr_in));
-
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(atoi(cport));
-    memcpy(&addr.sin_addr, he->h_addr, sizeof(addr.sin_addr));
-
-//    ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r, "connect to %d.%d.%d.%d:%d", he->h_addr[0], he->h_addr[1], he->h_addr[2], he->h_addr[3], atoi(cport));
-
-    if(connect(s, (struct sockaddr*)&addr, sizeof(struct sockaddr_in)) < 0) {
-        perror("socket");
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-	    "could connect socket %s:%d", chost, atoi(cport));
-	    close(s);
-	    return -1;
-    }
-
-    FILE *sock = fdopen(s, "r+");
-    // Disable buffer:
-    setvbuf(sock, NULL, _IONBF, 0);
+    
+    /* see the tutorial about the reason why we have to specify options again */
+    apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
+    apr_socket_timeout_set(s, (APR_USEC_PER_SEC * 10));
 
 	const char *cookie, *host, *remote_host;
 	authnz_socket_dir_config_rec *dir= (authnz_socket_dir_config_rec *)
 	    ap_get_module_config(r->per_dir_config, &authnz_socket_module);
 
-    fprintf(sock, "%s=%s\r\n", ENV_USER, r->user);
-    fprintf(sock, "%s=%s\r\n", dataname, data);
+    aprsprintf(s, "%s=%s\r\n", ENV_USER, r->user);
+    aprsprintf(s, "%s=%s\r\n", dataname, data);
 
 	remote_host= ap_get_remote_host(c, r->per_dir_config, REMOTE_HOST,NULL);
 	if (remote_host != NULL)
-        fprintf(sock, "%s=%s\r\n", ENV_HOST, remote_host);
+        aprsprintf(s, "%s=%s\r\n", ENV_HOST, remote_host);
 
 	if (r->useragent_ip)
-        fprintf(sock, "%s=%s\r\n", ENV_IP, r->useragent_ip);
+        aprsprintf(s, "%s=%s\r\n", ENV_IP, r->useragent_ip);
 
 	if (r->uri)
-        fprintf(sock, "%s=%s\r\n", ENV_URI, r->uri);
+        aprsprintf(s, "%s=%s\r\n", ENV_URI, r->uri);
 
 	if ((host= apr_table_get(r->headers_in, "Host")) != NULL)
-        fprintf(sock, "%s=%s\r\n", ENV_HTTP_HOST, host);
+        aprsprintf(s, "%s=%s\r\n", ENV_HTTP_HOST, host);
 
 	if (dir->context)
-        fprintf(sock, "%s=%s\r\n", ENV_CONTEXT, dir->context);
+        aprsprintf(s, "%s=%s\r\n", ENV_CONTEXT, dir->context);
 
 	if ((cookie= apr_table_get(r->headers_in, "Cookie")) != NULL)
-        fprintf(sock, "%s=%s\r\n", ENV_COOKIE, cookie);
+        aprsprintf(s, "%s=%s\r\n", ENV_COOKIE, cookie);
 
-    fprintf(sock, "\r\n");
+    aprsprintf(s, "\r\n");
 
     char buf[3];
     memset(buf, 0, sizeof(buf));
-    int len = read(s, buf, 2);
-    fclose(sock);
-    close(s);
+    apr_size_t len = sizeof(buf)-1;
 
-    if(len == 2 && buf[0] == 'O' && buf[1] == 'K') {
+    apr_status_t rv = apr_socket_recv(s, buf, &len);
+    apr_socket_close(s);
+
+    if(rv == APR_SUCCESS && len == 2 && buf[0] == 'O' && buf[1] == 'K') {
         return 0;
     }
 
