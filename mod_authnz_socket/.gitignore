@@ -1,0 +1,4 @@
+.libs
+mod_authnz_socket.la
+mod_authnz_socket.lo
+mod_authnz_socket.slo
